@@ -1,0 +1,26 @@
+{
+  "name": "antigravity-offload-mcp",
+  "version": "1.0.0",
+  "description": "Local stdio MCP server to offload heavy tasks from Antigravity to OpenCode Console (Pay-as-you-go / Go) and DeepSeek API.",
+  "type": "module",
+  "main": "dist/src/index.js",
+  "bin": {
+    "antigravity-offload-mcp": "dist/src/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/src/index.js",
+    "test": "npm run build && node --test dist/test/server.test.js",
+    "codex-login": "codex login",
+    "codex-status": "codex login status"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "@openai/codex-sdk": "^0.171.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.16.0",
+    "typescript": "^5.8.2"
+  }
+}
