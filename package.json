@@ -10,7 +10,7 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/src/index.js",
-    "test": "npm run build && node --test dist/test/server.test.js",
+    "test": "npm run build && node --test dist/test/server.test.js test/offload-turn-guard.test.cjs",
     "codex-login": "codex login",
     "codex-status": "codex login status"
   },

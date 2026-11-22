@@ -1,0 +1,17 @@
+{
+  "offload-turn-guard": {
+    "enabled": true,
+    "PreToolUse": [
+      {
+        "matcher": "call_mcp_tool|mcp_.*offload.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ./offload-turn-guard.cjs",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
