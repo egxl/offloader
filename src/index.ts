@@ -1,8 +1,11 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { fileURLToPath } from "node:url";
+import { execFile } from "node:child_process";
+import fsp from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { z } from "zod";
 import {
   copyFileToWorkspace,
@@ -12,6 +15,7 @@ import {
   writeWorkspaceFile,
 } from "./files.js";
 import {
+  CodexExecutionError,
   callCodexCompletion,
   generateCodexImage,
   getCodexAuthStatus,
@@ -29,6 +33,8 @@ import {
   type OffloadResponse,
 } from "./providers.js";
 
+const execFileAsync = promisify(execFile);
+
 export interface ServerDeps {
   env?: NodeJS.ProcessEnv;
   fetchFn?: typeof fetch;
@@ -37,6 +43,39 @@ export interface ServerDeps {
 
 const DEFAULT_SYSTEM_PROMPT =
   "You are an expert software engineering worker. Return accurate, concise, directly usable code, patches, or analysis.";
+
+async function getGitStatusPorcelain(workspaceDir: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync("git", ["status", "--porcelain"], {
+      cwd: workspaceDir,
+      maxBuffer: 1024 * 1024,
+    });
+    return stdout;
+  } catch {
+    return null;
+  }
+}
+
+async function getGitDiff(
+  workspaceDir: string,
+  baseRef: string,
+  maxBytes: number = 256 * 1024
+): Promise<{ diffText: string; truncated: boolean; bytes: number }> {
+  const ref = baseRef.trim();
+  if (!ref || ref.startsWith("-")) {
+    throw new Error(`Invalid git_diff_base "${baseRef}".`);
+  }
+  const { stdout } = await execFileAsync("git", ["diff", `${ref}...HEAD`], {
+    cwd: workspaceDir,
+    maxBuffer: maxBytes * 4,
+  });
+  const totalBytes = Buffer.byteLength(stdout, "utf8");
+  if (totalBytes > maxBytes) {
+    const sliced = Buffer.from(stdout, "utf8").subarray(0, maxBytes).toString("utf8");
+    return { diffText: sliced, truncated: true, bytes: Buffer.byteLength(sliced, "utf8") };
+  }
+  return { diffText: stdout, truncated: false, bytes: totalBytes };
+}
 
 export function createServer(deps: ServerDeps = {}): McpServer {
   const env = deps.env ?? process.env;
@@ -77,6 +116,18 @@ export function createServer(deps: ServerDeps = {}): McpServer {
           .optional()
           .describe(
             "Workspace-relative (or contained) file paths to read locally and include as context."
+          ),
+        allowed_files: z
+          .array(z.string())
+          .optional()
+          .describe(
+            "Optional workspace-relative file paths Codex is allowed to edit in write mode. Defaults to file_paths when provided."
+          ),
+        git_diff_base: z
+          .string()
+          .optional()
+          .describe(
+            "Optional git base ref (e.g. 'origin/main') to attach 'git diff <base>...HEAD' directly as context with strict hunk-only scoping."
           ),
         workspace_dir: z
           .string()
@@ -139,6 +190,18 @@ export function createServer(deps: ServerDeps = {}): McpServer {
           throw new Error(codexOutputError);
         }
 
+        let gitDiffText = "";
+        let gitDiffSummary = "";
+        if (args.git_diff_base?.trim()) {
+          const baseRef = args.git_diff_base.trim();
+          const diffRes = await getGitDiff(workspaceDir, baseRef);
+          const truncNote = diffRes.truncated ? "\n...[diff truncated at byte limit]" : "";
+          gitDiffText = diffRes.diffText.trim()
+            ? `\n\nAttached git diff (${baseRef}...HEAD):\n\`\`\`diff\n${diffRes.diffText}${truncNote}\n\`\`\`\n\nDiff scope rule: Cite ONLY files and symbols added (+) or modified in the diff hunks above. Do not list pre-existing unchanged symbols from surrounding files.`
+            : `\n\nAttached git diff (${baseRef}...HEAD): (empty diff — no changes against ${baseRef})`;
+          gitDiffSummary = ` | git_diff=${baseRef}...HEAD (${diffRes.bytes} bytes)`;
+        }
+
         const chain = getFallbackChain(resolvedProvider, env, args.allow_fallback);
         const failures: string[] = [];
         let firstErrorShort = "";
@@ -146,6 +209,12 @@ export function createServer(deps: ServerDeps = {}): McpServer {
         let attachedSummary = "";
 
         for (const candidate of chain) {
+          const isCodexWrite =
+            candidate === "codex" &&
+            (args.codex_sandbox === "workspace-write" ||
+              args.codex_sandbox === "danger-full-access");
+          let preGitStatus: string | null = null;
+
           try {
             if (candidate !== "codex" && args.input_images?.length) {
               throw new Error("HTTP providers do not support input_images");
@@ -160,16 +229,58 @@ export function createServer(deps: ServerDeps = {}): McpServer {
 
             if (args.file_paths && args.file_paths.length > 0) {
               if (candidate === "codex") {
-                const relPaths = args.file_paths.map(
-                  (p) => resolveWithinWorkspace(workspaceDir, p).relPath
+                const resolvedEntries = args.file_paths.map((p) =>
+                  resolveWithinWorkspace(workspaceDir, p)
                 );
-                userContent = `${args.prompt}\n\nFocus workspace files (read directly from disk as needed): ${relPaths.join(", ")}`;
-                attachedSummary = ` | focus_files=${relPaths.length}`;
+                const existingRelPaths: string[] = [];
+                const missingRelPaths: string[] = [];
+                let existingBytes = 0;
+
+                for (const entry of resolvedEntries) {
+                  try {
+                    const stat = await fsp.stat(entry.absPath);
+                    if (!stat.isFile()) {
+                      throw new Error(`"${entry.relPath}" is not a regular file.`);
+                    }
+                    existingRelPaths.push(entry.relPath);
+                    existingBytes += stat.size;
+                  } catch (statErr) {
+                    if ((statErr as NodeJS.ErrnoException)?.code === "ENOENT") {
+                      missingRelPaths.push(entry.relPath);
+                    } else {
+                      throw statErr;
+                    }
+                  }
+                }
+
+                const codexEmbedMaxBytes =
+                  Number(env.CODEX_EMBED_MAX_BYTES) || 64 * 1024;
+                if (existingRelPaths.length > 0 && existingBytes <= codexEmbedMaxBytes) {
+                  const loaded = await readWorkspaceFiles(
+                    workspaceDir,
+                    existingRelPaths,
+                    codexEmbedMaxBytes
+                  );
+                  userContent = `${args.prompt}\n\nAttached workspace files (already loaded in context — do not re-read via shell unless verifying edits):\n\n${loaded.contextText}`;
+                  if (missingRelPaths.length > 0) {
+                    userContent += `\n\nTarget files to create: ${missingRelPaths.join(", ")}`;
+                  }
+                  attachedSummary = ` | files=${loaded.loadedFiles.length} (${loaded.totalBytes} bytes)`;
+                } else {
+                  const relPaths = resolvedEntries.map((e) => e.relPath);
+                  userContent = `${args.prompt}\n\nFocus workspace files (read directly from disk as needed): ${relPaths.join(", ")}`;
+                  attachedSummary = ` | focus_files=${relPaths.length}`;
+                }
               } else {
                 const loaded = await readWorkspaceFiles(workspaceDir, args.file_paths);
                 userContent = `${args.prompt}\n\nAttached workspace files:\n\n${loaded.contextText}`;
                 attachedSummary = ` | files=${loaded.loadedFiles.length} (${loaded.totalBytes} bytes)`;
               }
+            }
+
+            if (gitDiffText) {
+              userContent += gitDiffText;
+              attachedSummary += gitDiffSummary;
             }
 
             if (candidate === "codex") {
@@ -179,6 +290,16 @@ export function createServer(deps: ServerDeps = {}): McpServer {
                       (f) => f.absPath
                     )
                   : undefined;
+              const allowedFiles = isCodexWrite
+                ? (args.allowed_files ?? args.file_paths)?.map(
+                    (p) => resolveWithinWorkspace(workspaceDir, p).relPath
+                  )
+                : undefined;
+
+              if (isCodexWrite) {
+                preGitStatus = await getGitStatusPorcelain(workspaceDir);
+              }
+
               result = await callCodexCompletion(
                 {
                   prompt: userContent,
@@ -190,6 +311,7 @@ export function createServer(deps: ServerDeps = {}): McpServer {
                   reasoningEffort: args.codex_reasoning_effort,
                   taskTier: args.task_tier,
                   fileCount: args.file_paths?.length ?? 0,
+                  allowedFiles,
                   includeReasoning: args.include_reasoning,
                   inputImages: resolvedInputImages,
                 },
@@ -222,6 +344,27 @@ export function createServer(deps: ServerDeps = {}): McpServer {
             break;
           } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
+
+            if (isCodexWrite) {
+              const postGitStatus = await getGitStatusPorcelain(workspaceDir);
+              const gitChanged =
+                preGitStatus !== null &&
+                postGitStatus !== null &&
+                postGitStatus !== preGitStatus;
+              const codexMutated =
+                err instanceof CodexExecutionError &&
+                (err.changedFiles.length > 0 || err.commandsRun.length > 0);
+              if (gitChanged || codexMutated) {
+                const threadHint =
+                  err instanceof CodexExecutionError && err.threadId
+                    ? ` (thread_id=${err.threadId})`
+                    : "";
+                throw new Error(
+                  `Codex write-mode failed after modifying workspace${threadHint}; automatic fallback to HTTP providers is blocked to prevent state corruption. Original error: ${message}`
+                );
+              }
+            }
+
             failures.push(`${candidate}: ${message}`);
             if (failures.length === 1) {
               firstErrorShort = message.split(/\r?\n/, 1)[0].slice(0, 160);
@@ -237,12 +380,13 @@ export function createServer(deps: ServerDeps = {}): McpServer {
           ? ` | fallback_from=${resolvedProvider} (${firstErrorShort})`
           : "";
         const threadText = result.threadId ? ` | thread=${result.threadId}` : "";
+        const partialText = result.partial ? " | partial=true" : "";
         const effortText = result.reasoningEffort !== undefined ? ` | effort=${result.reasoningEffort}` : "";
         const tierText = result.selectionTier !== undefined ? ` | tier=${result.selectionTier}` : "";
         const usageText = result.usage
           ? ` | tokens(in=${result.usage.prompt_tokens ?? "?"}, out=${result.usage.completion_tokens ?? "?"}, total=${result.usage.total_tokens ?? "?"})`
           : "";
-        const header = `[provider=${result.provider} | model=${result.model}${threadText}${attachedSummary}${effortText}${tierText}${usageText}${fallbackText}]`;
+        const header = `[provider=${result.provider} | model=${result.model}${threadText}${partialText}${attachedSummary}${effortText}${tierText}${usageText}${fallbackText}]`;
 
         if (args.output_file) {
           const writtenRel = await writeWorkspaceFile(

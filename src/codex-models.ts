@@ -111,15 +111,17 @@ export function inferCodexTaskTier(
   input: Pick<CodexSelectionInput, "prompt" | "sandboxMode" | "fileCount">
 ): Exclude<CodexTaskTier, "auto"> {
   const { prompt, sandboxMode, fileCount = 0 } = input;
-  if (fileCount >= 6 ||
-      /\b(architect(ure)?|system design|concurrenc|race condition|deadlock|migration|threat model|security audit|distributed|cross-cutting|multi-service|frontier)\b/i.test(prompt)) {
+  const allowsWrites = sandboxMode === "workspace-write" || sandboxMode === "danger-full-access";
+  if (!allowsWrites &&
+      /\b(architect(ure)?|system design|concurrenc|race condition|deadlock|threat model|security audit|distributed|cross-cutting|multi-service|frontier)\b/i.test(prompt)) {
     return "frontier";
   }
-  if (fileCount >= 3 ||
+  if (fileCount >= 6 ||
+      (!allowsWrites && fileCount >= 3) ||
       /\b(refactor|debug|root[- ]cause|review|audit|optimi[sz]e|test suite|investigate|diagnos[ei])\b/i.test(prompt)) {
     return "deep";
   }
-  if ((!sandboxMode || sandboxMode === "read-only") &&
+  if (!allowsWrites &&
       fileCount <= 1 && prompt.trim().length <= 320 &&
       /\b(pr description|pull request description|commit message|summari[sz]e|summary|format|typo|docstring|rename|explain briefly|changelog)\b/i.test(prompt)) {
     return "quick";

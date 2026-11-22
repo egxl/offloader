@@ -190,8 +190,8 @@ for (const allowFallback of [undefined, false]) {
         },
       });
       const text = (result.content as Array<{ text: string }>)[0].text;
-      assert.match(codexPrompt, /Focus workspace files.*input\.ts/);
-      assert.doesNotMatch(codexPrompt, /fromDisk/);
+      assert.match(codexPrompt, /Attached workspace files[\s\S]*input\.ts/);
+      assert.match(codexPrompt, /fromDisk/);
 
       if (allowFallback === false) {
         assert.equal(result.isError, true);
@@ -452,8 +452,8 @@ test("MCP tools support provider='codex' with thread start/resume and reasoning"
   assert.equal(startCalled, 1);
   assert.equal(lastSandbox, "read-only");
   assert.match(lastPrompt, /System instructions:\nBe concise/);
-  assert.match(lastPrompt, /Focus workspace files.*src[\\/]index\.ts/);
-  assert.match(firstText, /provider=codex \| model=chatgpt-subscription-default \| thread=thr_codex_123 \| focus_files=1/);
+  assert.match(lastPrompt, /Attached workspace files[\s\S]*src[\\/]index\.ts/);
+  assert.match(firstText, /provider=codex \| model=chatgpt-subscription-default \| thread=thr_codex_123 \| files=1 \(\d+ bytes\)/);
   assert.match(firstText, /<reasoning>\nAnalyzed repo\.\n<\/reasoning>/);
   assert.match(firstText, /Codex result output/);
 
@@ -558,7 +558,10 @@ test("Codex infers task tiers by complexity, prompt length, and sandbox", () => 
   const cases: Array<[Parameters<typeof inferCodexTaskTier>[0], string]> = [
     [{ prompt: "Review the architecture" }, "frontier"],
     [{ prompt: "SECURITY AUDIT" }, "frontier"],
-    [{ prompt: "Check this", fileCount: 6 }, "frontier"],
+    [{ prompt: "Check this", fileCount: 6 }, "deep"],
+    [{ prompt: "Apply migration", sandboxMode: "workspace-write" }, "standard"],
+    [{ prompt: "Implement architecture", sandboxMode: "workspace-write" }, "standard"],
+    [{ prompt: "Edit files", sandboxMode: "workspace-write", fileCount: 4 }, "standard"],
     [{ prompt: "Investigate a root-cause" }, "deep"],
     [{ prompt: "Format these", fileCount: 3 }, "deep"],
     [{ prompt: "Summarize", fileCount: 1, sandboxMode: "read-only" }, "quick"],
@@ -715,9 +718,9 @@ test("offload_task applies Codex model selection to SDK options and reports effo
   };
 
   const inferred = await offload({ file_paths: ["a", "b", "c", "d", "e", "f"] });
-  assert.equal(starts[0]?.model, "gpt-6.2-astra");
+  assert.equal(starts[0]?.model, "gpt-6.2-sol");
   assert.equal(starts[0]?.modelReasoningEffort, "high");
-  assert.equal(inferred, "[provider=codex | model=gpt-6.2-astra | thread=thr_pareto | focus_files=6 | effort=high | tier=frontier]");
+  assert.equal(inferred, "[provider=codex | model=gpt-6.2-sol | thread=thr_pareto | focus_files=6 | effort=high | tier=deep]");
 
   const explicitTier = await offload({ task_tier: "quick", codex_sandbox: "workspace-write" });
   assert.equal(starts[1]?.model, "gpt-6.2-sol");
@@ -843,4 +846,271 @@ test("generate_image prefixes $imagegen, copies new PNG into workspace_dir, and 
   } finally {
     await fs.rm(tmpRoot, { recursive: true, force: true });
   }
+});
+
+
+test("Codex runStreamed soft-timeout aborts cleanly and returns partial progress with threadId", async () => {
+  const codexFactory: CodexClientFactory = () => ({
+    startThread: () => ({
+      id: null,
+      async run() {
+        throw new Error("should use runStreamed");
+      },
+      async runStreamed(_input, turnOptions) {
+        return {
+          events: (async function* () {
+            yield { type: "thread.started" as const, thread_id: "thr_stream_partial" };
+            yield {
+              type: "item.completed" as const,
+              item: {
+                id: "item_1",
+                type: "file_change" as const,
+                status: "completed" as const,
+                changes: [{ kind: "update" as const, path: "src/app.ts" }],
+              },
+            };
+            yield {
+              type: "item.completed" as const,
+              item: {
+                id: "item_2",
+                type: "command_execution" as const,
+                command: "npm.cmd test",
+                aggregated_output: "running",
+                status: "completed" as const,
+                exit_code: 0,
+              },
+            };
+            await new Promise<void>((resolve) => {
+              if (turnOptions?.signal?.aborted) return resolve();
+              turnOptions?.signal?.addEventListener("abort", () => resolve(), { once: true });
+            });
+          })(),
+        };
+      },
+    }),
+    resumeThread: () => {
+      throw new Error("unexpected resume");
+    },
+  });
+
+  const res = await callCodexCompletion(
+    {
+      prompt: "Refactor everything",
+      workingDirectory: process.cwd(),
+      sandboxMode: "workspace-write",
+      softTimeoutSeconds: 0.02,
+    },
+    {},
+    codexFactory
+  );
+
+  assert.equal(res.partial, true);
+  assert.equal(res.threadId, "thr_stream_partial");
+  assert.deepEqual(res.changedFiles, ["update:src/app.ts"]);
+  assert.deepEqual(res.commandsRun, ["npm.cmd test (exit=0)"]);
+  assert.match(res.content, /thread_id="thr_stream_partial"/);
+});
+
+test("offload_task blocks HTTP fallback after Codex workspace-write mutates workspace", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "offload-dirty-guard-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await fs.writeFile(path.join(workspace, "target.ts"), "export const a = 1;\n");
+
+  let httpCalled = false;
+  const codexFactory: CodexClientFactory = () => ({
+    startThread: () => ({
+      id: "thr_dirty",
+      async run() {
+        throw new Error("should use runStreamed");
+      },
+      async runStreamed() {
+        return {
+          events: (async function* () {
+            yield { type: "thread.started" as const, thread_id: "thr_dirty" };
+            yield {
+              type: "item.completed" as const,
+              item: {
+                id: "fc_1",
+                type: "file_change" as const,
+                status: "completed" as const,
+                changes: [{ kind: "update" as const, path: "target.ts" }],
+              },
+            };
+            yield { type: "turn.failed" as const, error: { message: "mid-turn crash" } };
+          })(),
+        };
+      },
+    }),
+    resumeThread: () => {
+      throw new Error("unexpected resume");
+    },
+  });
+
+  const client = await connectTestClient(t, {
+    env: { CODEX_API_KEY: "codex-key", DEEPSEEK_API_KEY: "ds-key" },
+    codexFactory,
+    fetchFn: async () => {
+      httpCalled = true;
+      return new Response(JSON.stringify({ choices: [{ message: { content: "nope" } }] }), {
+        status: 200,
+      });
+    },
+  });
+
+  const result = await client.callTool({
+    name: "offload_task",
+    arguments: {
+      provider: "codex",
+      codex_sandbox: "workspace-write",
+      workspace_dir: workspace,
+      file_paths: ["target.ts"],
+      prompt: "Edit target",
+    },
+  });
+
+  assert.equal(result.isError, true);
+  assert.equal(httpCalled, false);
+  const text = (result.content as Array<{ text: string }>)[0].text;
+  assert.match(text, /automatic fallback to HTTP providers is blocked/i);
+  assert.match(text, /thread_id=thr_dirty/);
+});
+
+test("offload_task enforces allowed_files scope boundary in writeModeNote and falls back to focus_files above cap", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "offload-scope-cap-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await fs.writeFile(path.join(workspace, "a.ts"), "x".repeat(200));
+
+  const prompts: string[] = [];
+  const codexFactory: CodexClientFactory = () => ({
+    startThread: () => ({
+      id: "thr_scope",
+      async run(input) {
+        prompts.push(typeof input === "string" ? input : "");
+        return { finalResponse: "Done.", items: [], usage: null };
+      },
+    }),
+    resumeThread: () => {
+      throw new Error("unexpected resume");
+    },
+  });
+
+  const client = await connectTestClient(t, {
+    env: { CODEX_API_KEY: "codex-key", CODEX_EMBED_MAX_BYTES: "50" },
+    codexFactory,
+  });
+
+  const res = await client.callTool({
+    name: "offload_task",
+    arguments: {
+      provider: "codex",
+      codex_sandbox: "workspace-write",
+      workspace_dir: workspace,
+      file_paths: ["a.ts", "new_file.ts"],
+      allowed_files: ["a.ts"],
+      prompt: "Update a.ts",
+    },
+  });
+
+  assert.notEqual(res.isError, true, JSON.stringify(res.content));
+  const text = (res.content as Array<{ text: string }>)[0].text;
+  assert.match(text, /focus_files=2/);
+  assert.match(prompts[0], /Focus workspace files \(read directly from disk as needed\): a\.ts, new_file\.ts/);
+  assert.match(prompts[0], /Do not modify files outside \[a\.ts\]/);
+  assert.match(prompts[0], /Never invent parallel database tables/);
+});
+
+test("offload_task git_diff_base attaches hunk-scoped git diff and rejects flag-like base refs", async (t) => {
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const execFileAsync = promisify(execFile);
+
+  const repoDir = await fs.mkdtemp(path.join(os.tmpdir(), "offload-git-diff-"));
+  t.after(() => fs.rm(repoDir, { recursive: true, force: true }));
+
+  await execFileAsync("git", ["init"], { cwd: repoDir });
+  await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: repoDir });
+  await execFileAsync("git", ["config", "user.name", "Test"], { cwd: repoDir });
+  await fs.writeFile(path.join(repoDir, "svc.ts"), "export function oldFn() {}\n");
+  await execFileAsync("git", ["add", "svc.ts"], { cwd: repoDir });
+  await execFileAsync("git", ["commit", "-m", "base"], { cwd: repoDir });
+  const { stdout: baseSha } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: repoDir });
+
+  await fs.writeFile(
+    path.join(repoDir, "svc.ts"),
+    "export function oldFn() {}\nexport function newFn() { return 1; }\n"
+  );
+  await execFileAsync("git", ["add", "svc.ts"], { cwd: repoDir });
+  await execFileAsync("git", ["commit", "-m", "feat"], { cwd: repoDir });
+
+  let capturedPrompt = "";
+  const client = await connectTestClient(t, {
+    env: { CODEX_API_KEY: "codex-key" },
+    codexFactory: () => ({
+      startThread: () => ({
+        id: "thr_diff",
+        async run(input) {
+          capturedPrompt = typeof input === "string" ? input : "";
+          return { finalResponse: "PR summary ready.", items: [], usage: null };
+        },
+      }),
+      resumeThread: () => {
+        throw new Error("unexpected resume");
+      },
+    }),
+  });
+
+  const okRes = await client.callTool({
+    name: "offload_task",
+    arguments: {
+      provider: "codex",
+      workspace_dir: repoDir,
+      git_diff_base: baseSha.trim(),
+      prompt: "Summarize PR changes",
+    },
+  });
+  assert.notEqual(okRes.isError, true, JSON.stringify(okRes.content));
+  assert.match(capturedPrompt, /\+export function newFn\(\)/);
+  assert.match(capturedPrompt, /Cite ONLY files and symbols added \(\+\) or modified/);
+
+  const badRes = await client.callTool({
+    name: "offload_task",
+    arguments: {
+      provider: "codex",
+      workspace_dir: repoDir,
+      git_diff_base: "--output=/tmp/evil",
+      prompt: "Summarize PR changes",
+    },
+  });
+  assert.equal(badRes.isError, true);
+  assert.match((badRes.content as Array<{ text: string }>)[0].text, /Invalid git_diff_base/);
+});
+
+test("CODEX_PREPEND_PATH prepends to cloned env PATH without wiping inherited env", async () => {
+  const captured: Array<Record<string, string> | undefined> = [];
+  const codexFactory: CodexClientFactory = (options) => {
+    captured.push(options?.env);
+    return {
+      startThread: () => ({
+        id: "thr_env",
+        async run() {
+          return { finalResponse: "ok", items: [], usage: null };
+        },
+      }),
+      resumeThread: () => {
+        throw new Error("unexpected resume");
+      },
+    };
+  };
+
+  await callCodexCompletion(
+    { prompt: "Check", workingDirectory: process.cwd() },
+    { CODEX_PREPEND_PATH: "C:\\hermes\\node", CUSTOM_KEEP: "yes" },
+    codexFactory
+  );
+
+  assert.ok(captured[0]);
+  const pathKey = Object.keys(captured[0]).find((k) => k.toLowerCase() === "path");
+  assert.ok(pathKey);
+  assert.ok(captured[0][pathKey].startsWith(`C:\\hermes\\node${path.delimiter}`));
+  assert.equal(captured[0].CUSTOM_KEEP, "yes");
 });

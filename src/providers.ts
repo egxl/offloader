@@ -41,6 +41,7 @@ export interface OffloadResponse {
   threadId?: string;
   changedFiles?: string[];
   commandsRun?: string[];
+  partial?: boolean;
   usage?: {
     prompt_tokens?: number;
     completion_tokens?: number;
