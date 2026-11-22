@@ -2,12 +2,20 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import test from "node:test";
+import test, { type TestContext } from "node:test";
+import type { ThreadOptions } from "@openai/codex-sdk";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createServer } from "../src/index.js";
 import { callCodexCompletion, type CodexClientFactory } from "../src/codex.js";
+import {
+  clampReasoningEffort,
+  inferCodexTaskTier,
+  readCodexModelsCache,
+  selectCodexModelAndEffort,
+  type CodexSelectionInput,
+} from "../src/codex-models.js";
 import {
   callChatCompletion,
   getFallbackChain,
@@ -15,6 +23,51 @@ import {
   resolveProviderId,
 } from "../src/providers.js";
 import { resolveWithinWorkspace } from "../src/files.js";
+
+const codexCacheFixture = [
+  {
+    slug: "gpt-6.2-sol",
+    display_name: "GPT-6.2 Sol",
+    visibility: "list",
+    priority: 5,
+    default_reasoning_level: "medium",
+    supported_reasoning_levels: [
+      { effort: "low" }, { effort: "medium" }, { effort: "high" }, { effort: "max" },
+    ],
+  },
+  { slug: "gpt-unlisted", visibility: "list" },
+  { slug: "gpt-hidden-sol", visibility: "hide", priority: 0 },
+  { slug: "gpt-6-luna", visibility: "list", priority: 2 },
+  { slug: "gpt-6.1-terra", visibility: "list", priority: 3 },
+  { slug: "gpt-6.2-astra", visibility: "list", priority: 4 },
+  { slug: "gpt-6.1-sol", visibility: "list", priority: 1, description: " Previous generation model" },
+  { slug: "gpt-6-sol", visibility: "list", priority: 6, upgrade: { model: "gpt-6.2-sol" } },
+  { slug: "gpt-unspecified" },
+  null,
+];
+
+async function createTestCodexHome(t: TestContext, models?: readonly unknown[]) {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "offload-models-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const codexHome = path.join(root, "codex-home");
+  if (models) {
+    await fs.mkdir(codexHome);
+    await fs.writeFile(path.join(codexHome, "models_cache.json"), JSON.stringify({ models }));
+  }
+  return { CODEX_HOME: codexHome };
+}
+
+async function connectTestClient(t: TestContext, deps: Parameters<typeof createServer>[0]) {
+  const server = createServer(deps);
+  const client = new Client({ name: "codex-model-test", version: "1.0.0" });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  t.after(async () => {
+    await client.close();
+    await server.close();
+  });
+  await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+  return client;
+}
 
 test("provider configs use updated OpenCode Console, Go, and DeepSeek endpoints", () => {
   const configs = getProviderConfigs({});
@@ -305,7 +358,7 @@ test("stdio transport spawns dist/index.js and registers both tools", async () =
   await client.close();
 });
 
-test("MCP tools support provider='codex' with thread start/resume and reasoning", async () => {
+test("MCP tools support provider='codex' with thread start/resume and reasoning", async (t) => {
   let startCalled = 0;
   let resumeCalledWith: string | undefined;
   let lastSandbox: string | undefined;
@@ -366,7 +419,7 @@ test("MCP tools support provider='codex' with thread start/resume and reasoning"
   });
 
   const server = createServer({
-    env: {},
+    env: await createTestCodexHome(t),
     codexFactory: mockCodexFactory,
   });
   const client = new Client({ name: "codex-test-client", version: "1.0.0" });
@@ -438,6 +491,249 @@ test("MCP tools support provider='codex' with thread start/resume and reasoning"
 
   await client.close();
   await server.close();
+});
+
+test("list_offload_models uses the visible Codex cache and filters by ID or name", async (t) => {
+  const client = await connectTestClient(t, { env: await createTestCodexHome(t, codexCacheFixture) });
+
+  const list = async (filter?: string) => {
+    const result = await client.callTool({
+      name: "list_offload_models",
+      arguments: { provider: "codex", filter },
+    });
+    assert.notEqual(result.isError, true);
+    return (result.content as Array<{ text: string }>)[0].text;
+  };
+  const text = await list();
+  assert.match(text, /default=auto-pareto \(from models_cache\.json\)/);
+  assert.deepEqual(Array.from(text.matchAll(/^- ((?:gpt-|chatgpt-)[\w.-]+)/gm), (match) => match[1]), [
+    "chatgpt-subscription-default", "gpt-6.1-sol", "gpt-6-luna", "gpt-6.1-terra",
+    "gpt-6.2-astra", "gpt-6.2-sol", "gpt-6-sol", "gpt-unlisted",
+  ]);
+  assert.match(text, /gpt-6\.1-sol .*\[legacy\]/);
+  assert.match(text, /gpt-6-sol .*\[legacy\]/);
+  assert.match(text, /gpt-6-luna .*\[Pareto: quick\]/);
+  assert.match(text, /gpt-6\.1-terra .*\[Pareto: vision\]/);
+  assert.match(text, /gpt-6\.2-astra .*\[Pareto: frontier\]/);
+  assert.match(text, /gpt-6\.2-sol \(GPT-6\.2 Sol \[Pareto: standard\/deep; default: medium; supported: low, medium, high, max\]\)/);
+
+  const byName = await list("PARETO: VISION");
+  assert.match(byName, /\[1 matched\]:\n- gpt-6\.1-terra /);
+  const byId = await list("GPT-6.2-ASTRA");
+  assert.match(byId, /\[1 matched\]:\n- gpt-6\.2-astra /);
+});
+
+test("list_offload_models advertises the SDK default and static models without a Codex cache", async (t) => {
+  const client = await connectTestClient(t, { env: await createTestCodexHome(t) });
+  const result = await client.callTool({
+    name: "list_offload_models",
+    arguments: { provider: "codex" },
+  });
+  assert.notEqual(result.isError, true);
+  const text = (result.content as Array<{ text: string }>)[0].text;
+  assert.match(text, /default=chatgpt-subscription-default/);
+  assert.match(text, /\[3 matched\]:\n- chatgpt-subscription-default .*\n- gpt-6\.2-sol .*\n- gpt-6\.2-astra /);
+});
+
+test("Codex cache reader tolerates missing, malformed, and empty caches", async (t) => {
+  const env = await createTestCodexHome(t);
+  assert.equal(readCodexModelsCache(env), null);
+  await fs.mkdir(env.CODEX_HOME);
+  const cachePath = path.join(env.CODEX_HOME, "models_cache.json");
+  for (const contents of ["{bad JSON", "null", '{"models":{}}']) {
+    await fs.writeFile(cachePath, contents);
+    assert.equal(readCodexModelsCache(env), null);
+  }
+  await fs.writeFile(cachePath, '{"models":[]}');
+  assert.deepEqual(readCodexModelsCache(env), []);
+  assert.deepEqual(selectCodexModelAndEffort({ prompt: "Review architecture" }, env), {
+    model: undefined,
+    reasoningEffort: undefined,
+    source: "default",
+    reason: "Codex models cache unavailable; using SDK default.",
+  });
+});
+
+test("Codex infers task tiers by complexity, prompt length, and sandbox", () => {
+  const cases: Array<[Parameters<typeof inferCodexTaskTier>[0], string]> = [
+    [{ prompt: "Review the architecture" }, "frontier"],
+    [{ prompt: "SECURITY AUDIT" }, "frontier"],
+    [{ prompt: "Check this", fileCount: 6 }, "frontier"],
+    [{ prompt: "Investigate a root-cause" }, "deep"],
+    [{ prompt: "Format these", fileCount: 3 }, "deep"],
+    [{ prompt: "Summarize", fileCount: 1, sandboxMode: "read-only" }, "quick"],
+    [{ prompt: "Commit message" }, "quick"],
+    [{ prompt: "Format this", fileCount: 2 }, "standard"],
+    [{ prompt: "Fix typo", sandboxMode: "workspace-write" }, "standard"],
+    [{ prompt: "Summary" + "x".repeat(321) + " format" }, "standard"],
+    [{ prompt: "Add a feature" }, "standard"],
+  ];
+  for (const [input, tier] of cases) {
+    assert.equal(inferCodexTaskTier(input), tier, JSON.stringify(input));
+  }
+});
+
+test("Codex selects Pareto models and effort for all tiers and image input", async (t) => {
+  const env = await createTestCodexHome(t, codexCacheFixture);
+  const cases: Array<[Partial<CodexSelectionInput>, string, string]> = [
+    [{ taskTier: "quick", sandboxMode: "read-only" }, "gpt-6-luna", "medium"],
+    [{ taskTier: "quick", sandboxMode: "workspace-write" }, "gpt-6.2-sol", "low"],
+    [{ taskTier: "quick", sandboxMode: "danger-full-access" }, "gpt-6.2-sol", "low"],
+    [{ taskTier: "standard" }, "gpt-6.2-sol", "medium"],
+    [{ taskTier: "deep" }, "gpt-6.2-sol", "high"],
+    [{ taskTier: "frontier" }, "gpt-6.2-astra", "high"],
+    [{ taskTier: "quick", hasInputImages: true }, "gpt-6.1-terra", "medium"],
+    [{ taskTier: "frontier", hasInputImages: true }, "gpt-6.1-terra", "high"],
+  ];
+  for (const [input, model, reasoningEffort] of cases) {
+    const selection = selectCodexModelAndEffort({ prompt: "Review architecture", ...input }, env);
+    assert.deepEqual(
+      [selection.model, selection.reasoningEffort, selection.tier, selection.source],
+      [model, reasoningEffort, input.taskTier, "tier"]
+    );
+  }
+  const inferred = selectCodexModelAndEffort({ prompt: "Summarize this", taskTier: "auto" }, env);
+  assert.deepEqual([inferred.model, inferred.reasoningEffort, inferred.tier, inferred.source],
+    ["gpt-6-luna", "medium", "quick", "auto"]);
+});
+
+test("Codex discovers newer family winners and falls back when families are absent", async (t) => {
+  const env = await createTestCodexHome(t, codexCacheFixture);
+  const select = (taskTier: CodexSelectionInput["taskTier"], hasInputImages = false) =>
+    selectCodexModelAndEffort({ prompt: "Check this", taskTier, hasInputImages }, env);
+  const cachePath = path.join(env.CODEX_HOME, "models_cache.json");
+  assert.equal(select("standard").model, "gpt-6.2-sol");
+  await fs.writeFile(cachePath, JSON.stringify({
+    models: [...codexCacheFixture, { slug: "gpt-6.3-sol", visibility: "list", priority: 1 }],
+  }));
+  assert.equal(select("standard").model, "gpt-6.3-sol");
+
+  await fs.writeFile(cachePath, JSON.stringify({ models: [
+    { slug: "gpt-other", visibility: "list", priority: 0 },
+    { slug: "gpt-old-SOL", visibility: "list", priority: 1, description: "Legacy model" },
+    { slug: "gpt-older-sol", visibility: "list", priority: 2, upgrade: {} },
+  ] }));
+  const quick = select("quick");
+  assert.deepEqual([quick.model, quick.reasoningEffort], ["gpt-old-SOL", "low"]);
+  const frontier = select("frontier");
+  assert.deepEqual([frontier.model, frontier.reasoningEffort], ["gpt-old-SOL", "high"]);
+  assert.equal(select("standard", true).model, "gpt-old-SOL");
+
+  await fs.writeFile(cachePath, '{"models":[{"slug":"gpt-other","visibility":"list"}]}');
+  const fallback = select("quick");
+  assert.deepEqual([fallback.model, fallback.reasoningEffort], ["gpt-other", "low"]);
+});
+
+test("Codex clamps automatic effort to a model's supported reasoning levels", async (t) => {
+  const env = await createTestCodexHome(t, [
+    ...codexCacheFixture,
+    { slug: "gpt-custom", visibility: "list", default_reasoning_level: "high",
+      supported_reasoning_levels: [{ effort: "high" }, { effort: "low" }] },
+  ]);
+  const models = readCodexModelsCache(env);
+  const sol = models?.find((model) => model.slug === "gpt-6.2-sol");
+  assert.ok(sol);
+  assert.equal(clampReasoningEffort("ultra", sol), "max");
+  assert.equal(clampReasoningEffort("medium", sol), "medium");
+  assert.equal(clampReasoningEffort("minimal", sol), "medium");
+  assert.equal(clampReasoningEffort("minimal", { ...sol, default_reasoning_level: "HIGH" }), "low");
+  assert.equal(clampReasoningEffort("minimal", {
+    slug: "gpt-custom",
+    supported_reasoning_levels: [{ effort: "LOW" }],
+  }), "minimal");
+  const selection = selectCodexModelAndEffort({
+    prompt: "Check this", model: "gpt-custom", taskTier: "standard", hasInputImages: true,
+  }, env);
+  assert.deepEqual([selection.model, selection.reasoningEffort, selection.source],
+    ["gpt-custom", "low", "explicit"]);
+});
+
+test("Codex honors explicit options, environment overrides, and the auto-selection switch", async (t) => {
+  const env = await createTestCodexHome(t, codexCacheFixture);
+  const select = (
+    input: Partial<CodexSelectionInput>,
+    overrides: NodeJS.ProcessEnv = {}
+  ) => {
+    const { model, reasoningEffort, tier, source } = selectCodexModelAndEffort(
+      { prompt: "Review architecture", ...input }, { ...env, ...overrides }
+    );
+    return [model, reasoningEffort, tier, source];
+  };
+  const pair = { CODEX_MODEL: " env-model ", CODEX_REASONING_EFFORT: "max" };
+  assert.deepEqual(select({ model: " explicit-model ", reasoningEffort: "ultra", taskTier: "quick" }, pair),
+    ["explicit-model", "ultra", undefined, "explicit"]);
+  assert.deepEqual(select({ model: "explicit-model" }, pair), ["explicit-model", "max", undefined, "explicit"]);
+  assert.deepEqual(select({ reasoningEffort: "minimal" }, pair), ["env-model", "minimal", undefined, "explicit"]);
+  assert.deepEqual(select({ taskTier: "quick" }, pair), ["env-model", "max", undefined, "env"]);
+  assert.deepEqual(select({ taskTier: "quick" }, { CODEX_MODEL: "custom-model" }),
+    ["custom-model", "medium", "quick", "env"]);
+  assert.deepEqual(select({ taskTier: "standard" }, { CODEX_REASONING_EFFORT: "ultra" }),
+    ["gpt-6.2-sol", "ultra", "standard", "env"]);
+  assert.deepEqual(select({ taskTier: "standard" }, { CODEX_REASONING_EFFORT: "invalid" }),
+    ["gpt-6.2-sol", "medium", "standard", "tier"]);
+  assert.deepEqual(select({ isResume: true, taskTier: "auto" }), [undefined, undefined, undefined, "default"]);
+  assert.deepEqual(select({ isResume: true, taskTier: "deep" }), ["gpt-6.2-sol", "high", "deep", "tier"]);
+  assert.deepEqual(select({ isResume: true }, pair), ["env-model", "max", undefined, "env"]);
+  assert.deepEqual(select({ taskTier: "frontier" }, { CODEX_AUTO_SELECT: "0" }),
+    [undefined, undefined, undefined, "default"]);
+  assert.deepEqual(select({ model: "explicit-model" }, { CODEX_AUTO_SELECT: "0" }),
+    ["explicit-model", undefined, undefined, "explicit"]);
+  assert.deepEqual(select({}, { CODEX_REASONING_EFFORT: "high", CODEX_AUTO_SELECT: "FALSE" }),
+    [undefined, "high", undefined, "env"]);
+});
+
+test("offload_task applies Codex model selection to SDK options and reports effort and tier", async (t) => {
+  const starts: Array<ThreadOptions | undefined> = [];
+  const resumes: Array<{ id: string; options: ThreadOptions | undefined }> = [];
+  const codexFactory: CodexClientFactory = () => ({
+    startThread(options) {
+      starts.push(options);
+      return thread;
+    },
+    resumeThread(id, options) {
+      resumes.push({ id, options });
+      return thread;
+    },
+  });
+  const thread = {
+    id: "thr_pareto",
+    async run() {
+      return { finalResponse: "Done.", items: [], usage: null };
+    },
+  };
+  const client = await connectTestClient(t, {
+    env: await createTestCodexHome(t, codexCacheFixture),
+    codexFactory,
+  });
+  const offload = async (args: Record<string, unknown>) => {
+    const result = await client.callTool({
+      name: "offload_task",
+      arguments: { provider: "codex", prompt: "Check the files", ...args },
+    });
+    assert.notEqual(result.isError, true, JSON.stringify(result.content));
+    return (result.content as Array<{ text: string }>)[0].text.split("\n", 1)[0];
+  };
+
+  const inferred = await offload({ file_paths: ["a", "b", "c", "d", "e", "f"] });
+  assert.equal(starts[0]?.model, "gpt-6.2-astra");
+  assert.equal(starts[0]?.modelReasoningEffort, "high");
+  assert.equal(inferred, "[provider=codex | model=gpt-6.2-astra | thread=thr_pareto | focus_files=6 | effort=high | tier=frontier]");
+
+  const explicitTier = await offload({ task_tier: "quick", codex_sandbox: "workspace-write" });
+  assert.equal(starts[1]?.model, "gpt-6.2-sol");
+  assert.equal(starts[1]?.modelReasoningEffort, "low");
+  assert.equal(explicitTier, "[provider=codex | model=gpt-6.2-sol | thread=thr_pareto | effort=low | tier=quick]");
+
+  const explicitEffort = await offload({ codex_reasoning_effort: "ultra" });
+  assert.equal(starts[2]?.model, "gpt-6.2-sol");
+  assert.equal(starts[2]?.modelReasoningEffort, "ultra");
+  assert.equal(explicitEffort, "[provider=codex | model=gpt-6.2-sol | thread=thr_pareto | effort=ultra | tier=standard]");
+
+  const resumed = await offload({ thread_id: "thr_pareto", prompt: "Review architecture" });
+  assert.equal(resumes[0]?.id, "thr_pareto");
+  assert.equal(resumes[0]?.options?.model, undefined);
+  assert.equal(resumes[0]?.options?.modelReasoningEffort, undefined);
+  assert.equal(resumed, "[provider=codex | model=chatgpt-subscription-default | thread=thr_pareto]");
 });
 
 test("generate_image prefixes $imagegen, copies new PNG into workspace_dir, and supports input_images + thread_id", async () => {
