@@ -75,6 +75,14 @@ On Windows, you can alternatively load `sync-skills.cjs` relative to the user's 
 
 ---
 
+## Per-Turn Opt-Out (`/no-offload`)
+
+Add `/no-offload`, `--no-offload`, or `[no-offload]` as a standalone token in your prompt to run that turn directly in Antigravity. The tokens are case-insensitive. The bundled `/no-offload` skill skips `offload_task`, `generate_image`, and `list_offload_models` for that turn. Normal offloading resumes on subsequent turns without an opt-out token.
+
+The `PreToolUse` hook in `hooks.json` runs `offload-turn-guard.cjs` to block those tool calls. Both `hooks.json` and `offload-turn-guard.cjs` belong at the plugin root `~/.gemini/config/plugins/offload-worker/`.
+
+---
+
 ## MCP Tools
 
 ### `offload_task`
@@ -90,7 +98,9 @@ Delegates coding, testing, refactoring, debugging, reviews, or analysis to the a
 | `task_tier` | `"auto" \| "quick" \| "standard" \| "deep" \| "frontier"` | Codex Pareto routing tier (default: `"auto"`). |
 | `codex_sandbox` | `"read-only" \| "workspace-write" \| "danger-full-access"` | Codex sandbox mode (default: `"read-only"`). |
 | `codex_reasoning_effort` | `"minimal" \| "low" \| "medium" \| "high" \| "xhigh" \| "max" \| "ultra"` | Explicit Codex reasoning effort override. |
-| `file_paths` | `string[]` | Workspace-contained file paths to pass as focus paths (Codex) or attach inline up to 512 KiB (HTTP). |
+| `file_paths` | `string[]` | Workspace-contained file paths to embed inline up to `CODEX_MAX_EMBED_BYTES` (default 96 KiB, falling back to focus paths above the cap on Codex) or up to 512 KiB on HTTP providers. |
+| `allowed_files` | `string[]` | Workspace-relative file paths the Codex worker is permitted to create or modify in `workspace-write` mode (defaults to `file_paths` when omitted). |
+| `git_diff_base` | `string` | Git base ref (e.g. `"origin/main"`) to run `git diff <base>...HEAD` locally and attach hunk-scoped diff context for PR descriptions or diff reviews. |
 | `workspace_dir` | `string` | Base workspace directory for `file_paths`, `input_images`, and `output_file`. Defaults to `cwd`. |
 | `output_file` | `string` | Workspace-relative path to write the response text (do **not** combine with `workspace-write` or `danger-full-access` on Codex). |
 | `input_images` | `string[]` | Workspace image paths to attach (`codex` provider only). |
@@ -128,9 +138,9 @@ When `provider` resolves to `codex` and `model` / `codex_reasoning_effort` are o
 | --- | --- | --- | --- |
 | `auto` *(default)* | Inferred from prompt, `file_paths` count, and sandbox | Per inferred tier | Automatic routing when you do not specify a tier. |
 | `quick` | `*-luna` (`read-only`), `*-sol` (writes enabled) | `medium` on Luna, `low` on Sol | Short summaries, PR/commit descriptions, docstrings, simple read-only tasks. |
-| `standard` | `*-sol` | `medium` | Everyday coding, localized edits, unit tests. |
-| `deep` | `*-sol` | `high` | Multi-file refactors (`>= 3` files), debugging, code reviews, audits. |
-| `frontier` | `*-astra` | `high` | Architecture, migrations, concurrency/race debugging, security threat modeling, `>= 6` files. |
+| `standard` | `*-sol` | `medium` | Everyday coding, localized edits, well-scoped `workspace-write` execution, unit tests. |
+| `deep` | `*-sol` | `high` | Multi-file refactors (`>= 3` read-only or `>= 6` write files), debugging, code reviews, audits. |
+| `frontier` | `*-astra` | `high` | Read-only architecture, concurrency/race debugging, security threat modeling, or explicit `task_tier: "frontier"`. |
 | `input_images` set | `*-terra` | `medium` (`high` for `deep`/`frontier`) | UI screenshots, visual debugging, computer-use inspection. |
 
 ### Routing Rules & Precedence
@@ -156,6 +166,9 @@ When `provider` is omitted, the server resolves the active provider in this orde
 | `CODEX_REASONING_EFFORT` | Unset | Default Codex effort (`minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`) when omitted. |
 | `CODEX_AUTO_SELECT` | Enabled | Set to `0` or `false` to disable Pareto auto-selection and use only overrides/SDK defaults. |
 | `CODEX_WINDOWS_SANDBOX` | `unelevated` | Windows sandbox mode passed for `workspace-write` (`prefer_mxc: true`). |
+| `CODEX_SOFT_TIMEOUT_SECONDS` | `510` | Internal soft-deadline (`AbortController`) for `thread.runStreamed()`; returns partial progress and `threadId` before MCP's 600s hard timeout. |
+| `CODEX_MAX_EMBED_BYTES` | `98304` (`96 KiB`) | Max total bytes of `file_paths` embedded directly into Codex prompts before falling back to path-only focus hints. |
+| `CODEX_PREPEND_PATH` | Unset | Directory prepended to `PATH` inside Codex child processes without wiping inherited environment variables. |
 | `CODEX_API_KEY` / `OPENAI_API_KEY` | Unset | Optional API key auth for Codex instead of ChatGPT subscription login. |
 | `OPENCODE_GO_API_KEY` | Unset | API key for OpenCode Go subscription endpoint. |
 | `OPENCODE_API_KEY` | Unset | API key for OpenCode Console (also reused by OpenCode Go). |
@@ -177,14 +190,16 @@ Add the following to `~/.gemini/GEMINI.md` (or your project `AGENTS.md`) so Anti
 ```markdown
 # Global Offloading Rule
 
-When `offload-worker` tools (`offload_task`, `generate_image`) are available in `<mcp_servers>`:
+When `offload-worker` tools (`offload_task`, `generate_image`) are available in `<mcp_servers>` — **unless the current user prompt contains `/no-offload`, `--no-offload`, or `[no-offload]`**:
 
-1. **Delegate heavy work first:** Before reading/editing multiple files or writing substantial code/tests/refactors inline, call `offload_task` (`provider="codex"`, `codex_sandbox="workspace-write"` for edits/tests; `"read-only"` for reviews/audits). Do not pre-read large target files in Antigravity first.
+0. **Per-turn opt-out:** If the current user prompt contains `/no-offload`, `--no-offload`, or `[no-offload]`, skip all `offload-worker` tools (`offload_task`, `generate_image`, `list_offload_models`) for that turn only and execute directly in Antigravity. Resume normal offloading on subsequent turns without an opt-out token.
+
+1. **Discover architecture before delegating multi-file work:** For multi-file feature or migration tasks, first run a fast architectural discovery pass (listing latest migrations, canonical services, and shared store schemas) and pass those exact canonical table/symbol names in `prompt`, `file_paths`, and `allowed_files` when calling `offload_task` (`provider="codex"`, `codex_sandbox="workspace-write"` for edits/tests; `"read-only"` for reviews/audits). Do not pre-read large unrelated files in Antigravity.
 2. **Image tasks:** Use `generate_image` with `output_file` for image creation or editing.
-3. **Fallback on errors:** If `codex` hits quota, rate limits, auth errors, or fails, allow `offload_task` to fall back to `opencode-go`, `opencode`, or `deepseek` (or retry explicitly with one of those `provider` values). If all offload providers fail or `offload_task` is disabled in the current session, execute directly.
+3. **Fallback on errors:** If `codex` hits quota, rate limits, auth errors, or fails before modifying the workspace, allow `offload_task` to fall back to `opencode-go`, `opencode`, or `deepseek` (or retry explicitly with one of those `provider` values). Once `codex` in write mode has modified files or hit a soft timeout (`partial=true`), resume with its `thread_id` instead of falling back to HTTP providers. If all offload providers fail or `offload_task` is disabled in the current session, execute directly.
 4. **Skip offloading for trivial turns:** Answer simple questions, 1-line commands, or single small lookups directly without spawning an offload call.
-5. **Verify after writes:** Run targeted tests or `git diff --stat` after `workspace-write` tasks before reporting completion.
-6. **PR descriptions:** Before `gh pr create` (or `gh pr edit`), run a `read-only` `offload_task` against `git diff origin/main...HEAD` (or the target base branch) to generate a structured PR body in normal prose (no caveman compression) with grouped `### Changes` (exact file paths and symbol names) and `### Verification` (exact test/build output). Write the PR body to a scratch `.md` file and pass it via `gh pr create --body-file <path>` to avoid PowerShell newline/backtick mangling.
+5. **Verify after writes:** Run targeted tests (`npm.cmd` on Windows) or `git diff --stat` after `workspace-write` tasks before reporting completion.
+6. **PR descriptions:** Before `gh pr create` (or `gh pr edit`), run a `read-only` `offload_task` with `git_diff_base="origin/main"` (or the target base branch; do **not** pass full `file_paths`) to generate a structured PR body in normal prose (no caveman compression) citing only files and symbols added (`+`) or modified in the diff hunks, with grouped `### Changes` and `### Verification`. Write the PR body to a scratch `.md` file and pass it via `gh pr create --body-file <path>` to avoid PowerShell newline/backtick mangling.
 ```
 
 Rule 6 prevents weak PR descriptions caused by summarizing only `offload_task`'s short reply, PowerShell `--body "..."` newline/backtick mangling, or terse prose bleeding into PRs.

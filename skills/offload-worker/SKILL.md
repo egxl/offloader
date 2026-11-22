@@ -14,13 +14,18 @@ Delegate token-heavy coding and analysis to external backends through the bundle
 `offload-worker` MCP server (`offload_task`, `generate_image`, `list_offload_models`)
 while keeping Antigravity as a minimal orchestrator.
 
-## Strict Delegate-First Rules
+## Strict Orchestration Rules
 
-1. **Delegate on step 1:** When `/offload-worker` is invoked or a coding/test/refactor/review
-   task is requested, call `offload_task` immediately as your first tool call. Do **not**
-   run `read_file`, `edit_file`, `write_file`, or `search_web` in Antigravity first unless
-   you only need 1 tiny path lookup that `offload_task` cannot resolve.
-2. **Use `codex_sandbox: "workspace-write"` for edits & tests:**
+1. **Discover architecture before multi-file feature delegation:**
+   - For multi-file features or schema/migration changes, run a fast architectural discovery
+     pass first (list latest migrations, canonical services, and shared store schemas) and
+     pass those exact canonical table/symbol names in `prompt`, `file_paths`, and
+     `allowed_files` so the worker extends existing tables/services instead of inventing
+     parallel ones.
+   - For well-scoped single-file edits, reviews, or refactors where targets are already known,
+     call `offload_task` immediately on step 1 without pre-reading large target files.
+2. **Use `codex_sandbox: "workspace-write"` with explicit scope for edits & tests:**
+   - Pass `allowed_files` (or accurate `file_paths`) to guard against out-of-scope edits.
    - Instruct the worker to edit files and run tests/build in `workspace_dir` and return
      only a concise summary.
    - Keep `codex_sandbox: "read-only"` (default) for reviews, audits, and Q&A.
@@ -29,19 +34,28 @@ while keeping Antigravity as a minimal orchestrator.
    - Use `output_file` only with HTTP providers (`opencode`, `opencode-go`, `deepseek`)
      or `codex` in `read-only` mode.
 4. **Prevent edit collisions:** Wait for `offload_task` to finish before touching the
-   same files in Antigravity.
+   same files in Antigravity. If a partial soft-timeout returns (`partial=true`), resume
+   with the returned `thread_id`.
 5. **Reuse threads & batch tasks:** Bundle related subtasks into one `offload_task` call
    and pass `thread_id` (Codex) or `session_id` (OpenCode) for follow-ups.
 6. **Verify minimally:** Run `git diff --stat` or the project's test command if Codex did
-   not already report passing test output.
+   not already report passing test output. On Windows, use `npm.cmd` instead of `npm.ps1`.
+
+## Per-Turn Opt-Out
+
+When the user prompt contains `/no-offload`, `--no-offload`, or `[no-offload]`, skip
+all `offload-worker` tools for that turn and execute directly in Antigravity.
+The `PreToolUse` hook in `hooks.json` enforces this through `offload-turn-guard.cjs`.
 
 ## Pull Request Descriptions
 
 When creating or updating a PR after offloaded work:
 
-1. **Generate from `git diff`:** Run a `read-only` `offload_task` on
-   `git diff origin/main...HEAD` (or `git diff <base>...HEAD`), optionally using
-   `output_file` to write directly to a scratch `.md` file.
+1. **Generate from `git_diff_base` (never full `file_paths`):** Run a `read-only`
+   `offload_task` with `git_diff_base: "origin/main"` (or the target base branch),
+   optionally using `output_file` to write directly to a scratch `.md` file. Do not pass
+   full `file_paths`, and instruct the worker to cite only files and symbols added (`+`)
+   or modified in the diff hunks.
 2. **Normal prose & structure:** Use normal technical prose (never caveman-compressed),
    with grouped `### Changes` (exact file paths and symbol names) and
    `### Verification` (exact test/build results).
@@ -53,7 +67,9 @@ When creating or updating a PR after offloaded work:
 1. **Primary (`codex`):** Uses `@openai/codex-sdk` via ChatGPT subscription (`codex login`).
 2. **Fallback (`opencode-go` → `opencode` → `deepseek`):**
    - `offload_task` automatically falls back across configured providers when `codex`
-     fails (quota, rate limit, auth, or runtime error) unless `allow_fallback: false`.
+     fails before modifying the workspace (quota, rate limit, auth).
+   - Automatic fallback to HTTP providers is blocked once `codex` in write mode modifies
+     files or runs commands, preventing split-brain state corruption.
    - Note: OpenCode `*-free` models return `403` outside OpenCode CLI/Desktop; use paid
      Console or Go models.
    - If `offload_task` reports all providers failed (or is unavailable in the current chat),
@@ -70,9 +86,10 @@ Omit `model` and `codex_reasoning_effort` to let Codex route tasks through
 `task_tier` explicitly to choose a rung of the Pareto ladder.
 
 - `quick` uses Luna at `medium` for read-only tasks, or Sol at `low` for writes.
-- `standard` uses Sol at `medium`.
-- `deep` uses Sol at `high`.
-- `frontier` uses Astra at `high`.
+- `standard` uses Sol at `medium` (default for well-scoped write execution).
+- `deep` uses Sol at `high` (6+ files, refactors, debugging, or audits).
+- `frontier` uses Astra at `high` (reserved for read-only architecture/concurrency/security
+  analysis or explicit `task_tier: "frontier"`).
 
 Image inputs prefer Terra at `medium`, or `high` for `deep` and `frontier`.
 Missing families fall back to Sol and then the first visible cached model.
