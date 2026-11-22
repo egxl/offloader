@@ -1,6 +1,5 @@
 import fs from "node:fs";
 import fsp from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import {
   Codex,
@@ -16,6 +15,7 @@ import {
   type ThreadOptions,
   type UserInput,
 } from "@openai/codex-sdk";
+import { getCodexHome, selectCodexModelAndEffort, type CodexTaskTier } from "./codex-models.js";
 import type { OffloadResponse } from "./providers.js";
 
 export interface CodexOffloadParams {
@@ -26,6 +26,8 @@ export interface CodexOffloadParams {
   threadId?: string;
   sandboxMode?: SandboxMode;
   reasoningEffort?: ModelReasoningEffort;
+  taskTier?: CodexTaskTier;
+  fileCount?: number;
   includeReasoning?: boolean;
   inputImages?: string[];
 }
@@ -57,7 +59,7 @@ export function getCodexAuthStatus(
     return { configured: true, detail: "configured (API key)" };
   }
 
-  const codexHome = env.CODEX_HOME?.trim() || path.join(os.homedir(), ".codex");
+  const codexHome = getCodexHome(env);
   const authPath = path.join(codexHome, "auth.json");
   if (fs.existsSync(authPath)) {
     return { configured: true, detail: "configured (ChatGPT login)" };
@@ -102,6 +104,16 @@ export async function callCodexCompletion(
   }
 
   const sandboxMode = params.sandboxMode ?? "read-only";
+  const selection = selectCodexModelAndEffort({
+    prompt: params.prompt,
+    model: params.model,
+    reasoningEffort: params.reasoningEffort,
+    taskTier: params.taskTier,
+    sandboxMode,
+    fileCount: params.fileCount ?? 0,
+    hasInputImages: Boolean(params.inputImages?.length),
+    isResume: Boolean(params.threadId?.trim()),
+  }, env);
   if (process.platform === "win32" && sandboxMode === "workspace-write") {
     codexOptions.config = {
       features: { prefer_mxc: true },
@@ -115,11 +127,11 @@ export async function callCodexCompletion(
     approvalPolicy: "never",
   };
 
-  if (params.model?.trim()) {
-    threadOptions.model = params.model.trim();
+  if (selection.model !== undefined) {
+    threadOptions.model = selection.model;
   }
-  if (params.reasoningEffort) {
-    threadOptions.modelReasoningEffort = params.reasoningEffort;
+  if (selection.reasoningEffort !== undefined) {
+    threadOptions.modelReasoningEffort = selection.reasoningEffort;
   }
 
   const writeModeNote =
@@ -173,7 +185,9 @@ export async function callCodexCompletion(
 
     return {
       provider: "codex",
-      model: params.model?.trim() || "chatgpt-subscription-default",
+      model: selection.model || "chatgpt-subscription-default",
+      reasoningEffort: selection.reasoningEffort,
+      selectionTier: selection.tier,
       content,
       reasoning:
         reasoningParts.length > 0 ? reasoningParts.join("\n\n") : undefined,
@@ -236,7 +250,7 @@ export async function generateCodexImage(
   env: NodeJS.ProcessEnv = process.env,
   clientFactory: CodexClientFactory = defaultCodexFactory
 ): Promise<OffloadResponse & { threadId?: string; generatedImages: string[] }> {
-  const codexHome = env.CODEX_HOME?.trim() || path.join(os.homedir(), ".codex");
+  const codexHome = getCodexHome(env);
   const priorImages = new Set<string>();
   if (params.threadId?.trim()) {
     const existing = await listGeneratedImagesInDir(

@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { getCodexAuthStatus } from "./codex.js";
+import { getCodexModelSummaries } from "./codex-models.js";
 
 export type HttpProviderId = "opencode" | "opencode-go" | "deepseek";
 export type ProviderId = HttpProviderId | "codex";
@@ -34,6 +35,8 @@ export interface OffloadResponse {
   model: string;
   content: string;
   reasoning?: string;
+  reasoningEffort?: string;
+  selectionTier?: string;
   finishReason?: string;
   threadId?: string;
   changedFiles?: string[];
@@ -296,26 +299,10 @@ export async function fetchProviderModels(
 ): Promise<{ provider: ProviderId; label: string; models: ModelSummary[] }> {
   const providerId = resolveProviderId(provider, env);
   if (providerId === "codex") {
-    let models: ModelSummary[] = [
-      {
-        id: "chatgpt-subscription-default",
-        name: "Default model for your ChatGPT plan (omit 'model' parameter)",
-      },
-      { id: "gpt-5.4", name: "GPT-5.4 (ChatGPT subscription / API)" },
-      { id: "gpt-5.3-codex", name: "GPT-5.3 Codex (ChatGPT subscription / API)" },
-    ];
-    if (filter?.trim()) {
-      const needle = filter.trim().toLowerCase();
-      models = models.filter(
-        (m) =>
-          m.id.toLowerCase().includes(needle) ||
-          (m.name && m.name.toLowerCase().includes(needle))
-      );
-    }
     return {
       provider: "codex",
       label: "OpenAI Codex CLI (ChatGPT Subscription)",
-      models,
+      models: getCodexModelSummaries(env, filter),
     };
   }
 

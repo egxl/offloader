@@ -17,6 +17,7 @@ import {
   getCodexAuthStatus,
   type CodexClientFactory,
 } from "./codex.js";
+import { CODEX_REASONING_EFFORTS, CODEX_TASK_TIERS, readCodexModelsCache } from "./codex-models.js";
 import {
   callChatCompletion,
   fetchProviderModels,
@@ -69,7 +70,7 @@ export function createServer(deps: ServerDeps = {}): McpServer {
           .string()
           .optional()
           .describe(
-            "Model ID (e.g. 'deepseek-chat', 'deepseek-reasoner', 'deepseek-v4.1-flash', 'kimi-k3', or omit for Codex ChatGPT plan default)."
+            "Model ID (e.g. 'deepseek-chat', 'deepseek-reasoner', 'deepseek-v4.1-flash', 'kimi-k3'). For Codex, omit to enable auto-Pareto model selection."
           ),
         file_paths: z
           .array(z.string())
@@ -104,9 +105,13 @@ export function createServer(deps: ServerDeps = {}): McpServer {
           .optional()
           .describe("Codex sandbox mode (default: 'read-only')."),
         codex_reasoning_effort: z
-          .enum(["minimal", "low", "medium", "high", "xhigh"])
+          .enum(CODEX_REASONING_EFFORTS)
           .optional()
           .describe("Codex reasoning effort override."),
+        task_tier: z
+          .enum(CODEX_TASK_TIERS)
+          .optional()
+          .describe("Codex auto-Pareto routing tier. Use 'auto' (default) to infer the tier from the task, or choose 'quick', 'standard', 'deep', or 'frontier'."),
         input_images: z
           .array(z.string())
           .optional()
@@ -183,6 +188,8 @@ export function createServer(deps: ServerDeps = {}): McpServer {
                   threadId: args.thread_id,
                   sandboxMode: args.codex_sandbox,
                   reasoningEffort: args.codex_reasoning_effort,
+                  taskTier: args.task_tier,
+                  fileCount: args.file_paths?.length ?? 0,
                   includeReasoning: args.include_reasoning,
                   inputImages: resolvedInputImages,
                 },
@@ -230,10 +237,12 @@ export function createServer(deps: ServerDeps = {}): McpServer {
           ? ` | fallback_from=${resolvedProvider} (${firstErrorShort})`
           : "";
         const threadText = result.threadId ? ` | thread=${result.threadId}` : "";
+        const effortText = result.reasoningEffort !== undefined ? ` | effort=${result.reasoningEffort}` : "";
+        const tierText = result.selectionTier !== undefined ? ` | tier=${result.selectionTier}` : "";
         const usageText = result.usage
           ? ` | tokens(in=${result.usage.prompt_tokens ?? "?"}, out=${result.usage.completion_tokens ?? "?"}, total=${result.usage.total_tokens ?? "?"})`
           : "";
-        const header = `[provider=${result.provider} | model=${result.model}${threadText}${attachedSummary}${usageText}${fallbackText}]`;
+        const header = `[provider=${result.provider} | model=${result.model}${threadText}${attachedSummary}${effortText}${tierText}${usageText}${fallbackText}]`;
 
         if (args.output_file) {
           const writtenRel = await writeWorkspaceFile(
@@ -304,8 +313,11 @@ export function createServer(deps: ServerDeps = {}): McpServer {
           return `- ${c.id} (${c.label}): ${configured} | default=${c.defaultModel}`;
         });
         const codexStatus = getCodexAuthStatus(env);
+        const codexDefault = readCodexModelsCache(env)?.length
+          ? "auto-pareto (from models_cache.json)"
+          : "chatgpt-subscription-default";
         statusLines.push(
-          `- codex (OpenAI Codex CLI / ChatGPT Subscription): ${codexStatus.detail} | default=chatgpt-subscription-default`
+          `- codex (OpenAI Codex CLI / ChatGPT Subscription): ${codexStatus.detail} | default=${codexDefault}`
         );
 
         const activeProvider = resolveProviderId(args.provider, env);
