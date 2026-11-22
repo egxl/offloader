@@ -62,6 +62,30 @@ When creating or updating a PR after offloaded work:
 If unsure which providers are authenticated or which model IDs exist, call
 `list_offload_models`.
 
+## Automatic Codex Model Selection
+
+Omit `model` and `codex_reasoning_effort` to let Codex route tasks through
+`$CODEX_HOME/models_cache.json` (defaults to `~/.codex/models_cache.json`).
+`task_tier: "auto"` infers a tier from the prompt, file count, and sandbox. Set
+`task_tier` explicitly to choose a rung of the Pareto ladder.
+
+- `quick` uses Luna at `medium` for read-only tasks, or Sol at `low` for writes.
+- `standard` uses Sol at `medium`.
+- `deep` uses Sol at `high`.
+- `frontier` uses Astra at `high`.
+
+Image inputs prefer Terra at `medium`, or `high` for `deep` and `frontier`.
+Missing families fall back to Sol and then the first visible cached model.
+Auto-selected effort is adjusted to the model's supported levels. An unavailable
+cache leaves omitted settings to the SDK. A resumed `thread_id` with no overrides
+preserves the thread's defaults.
+
+`codex_reasoning_effort` accepts `minimal`, `low`, `medium`, `high`, `xhigh`,
+`max`, and `ultra`. Tool arguments take precedence over `CODEX_MODEL` and
+`CODEX_REASONING_EFFORT`. Set `CODEX_AUTO_SELECT=0` or `false` to disable the
+ladder. Call `list_offload_models` to see the cache's Pareto roles and reasoning
+levels.
+
 ## Image Generation & Editing (`generate_image`)
 
 1. Call `generate_image` with `prompt`, `workspace_dir`, and `output_file` (e.g.

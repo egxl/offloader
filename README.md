@@ -11,6 +11,35 @@ Install the plugin under `~/.gemini/config/plugins/offload-worker`, put Node.js
 20.6 or newer on PATH, and set the final MCP argument in `mcp_config.json` to
 the local offload-worker server build.
 
+## Automatic Codex Model Selection
+
+For Codex tasks, `offload_task` reads visible models and their supported reasoning
+efforts from `$CODEX_HOME/models_cache.json`. If `CODEX_HOME` is unset, it uses
+`~/.codex`. Each family uses the lowest-priority-number model among its current
+entries, with legacy entries as a fallback. `list_offload_models` shows the cached
+models, Pareto roles, and available efforts.
+
+| `task_tier` | Preferred Codex model family | Reasoning effort |
+| --- | --- | --- |
+| `auto` (default) | Inferred from the prompt, file count, and sandbox | Per inferred tier |
+| `quick` | Luna for read-only tasks, Sol for write-enabled tasks | `medium` on Luna, `low` on Sol |
+| `standard` | Sol | `medium` |
+| `deep` | Sol | `high` |
+| `frontier` | Astra | `high` |
+
+Image inputs prefer Terra at `medium`, or `high` for deep and frontier tasks.
+Routing falls back to Sol and then the first visible model when the preferred
+family is unavailable. Automatic effort is adjusted to the selected model's
+supported levels. With no usable cache, Codex uses SDK defaults for any settings
+you leave unspecified. Resuming via `thread_id` without overrides preserves the
+thread's defaults.
+
+Set `model` or `codex_reasoning_effort` to override automatic selection. Supported
+effort values are `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`.
+`CODEX_MODEL` and `CODEX_REASONING_EFFORT` supply overrides when the corresponding
+tool argument is omitted. Set `CODEX_AUTO_SELECT=0` or `false` to disable the
+Pareto ladder and use only overrides and SDK defaults.
+
 ## Recommended Global Rule (`~/.gemini/GEMINI.md`)
 
 Add the following to `~/.gemini/GEMINI.md` (or your project `AGENTS.md`) so the
