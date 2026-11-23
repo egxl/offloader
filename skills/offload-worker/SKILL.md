@@ -47,6 +47,20 @@ When the user prompt contains `/no-offload`, `--no-offload`, or `[no-offload]`, 
 all `offload-worker` tools for that turn and execute directly in Antigravity.
 The `PreToolUse` hook in `hooks.json` enforces this through `offload-turn-guard.cjs`.
 
+## Invoking Antigravity Skills in Codex
+
+Antigravity skills (`~/.gemini/config/skills` and plugin `skills/` folders) are linked into
+`$CODEX_HOME/skills` at server startup by `sync-skills.cjs`, so Codex loads them natively.
+
+- When the task calls for a skill (e.g. ponytail, test-driven-development), start the
+  `offload_task` prompt with `Use the $<skill-name> skill.` using the exact skill folder name.
+- Never paraphrase a skill (e.g. "minimal, clean code (ponytail principle)"). Codex only
+  loads the skill reliably on an explicit `$name` mention.
+- Skills load only with `provider: "codex"`. HTTP providers (`opencode`, `opencode-go`,
+  `deepseek`) ignore `$name` mentions.
+- If the result header shows `Warning: Codex skill not found`, the skill is not synced;
+  check the name or restart the MCP server to re-run `sync-skills.cjs`.
+
 ## Pull Request Descriptions
 
 When creating or updating a PR after offloaded work:

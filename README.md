@@ -10,6 +10,7 @@ A local stdio MCP server and Antigravity plugin that delegates token-heavy codin
 - **Stateful Thread & Session Continuity:** Preserves Codex `thread_id` across turns (without mutating cached model defaults on resume) and attaches `x-opencode-session` (`ses_...`) headers for OpenCode prompt cache routing.
 - **Image Generation & Editing:** Exposes Codex `$imagegen` (`gpt-image-2`) through `generate_image`, supporting reference `input_images`, iterative `thread_id` refinement, and copying generated PNGs into the workspace.
 - **Automatic Codex Skill Sync:** Links Antigravity skills (`~/.gemini/config/skills` and installed plugin `skills/` directories) into `$CODEX_HOME/skills` at MCP server startup via `sync-skills.cjs`.
+  - Invoke synced skills natively via `$skill-name` in `offload_task` prompts; the server warns when a referenced skill is missing from `$CODEX_HOME/skills`.
 
 ---
 
