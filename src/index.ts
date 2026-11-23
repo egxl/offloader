@@ -21,7 +21,14 @@ import {
   getCodexAuthStatus,
   type CodexClientFactory,
 } from "./codex.js";
-import { CODEX_REASONING_EFFORTS, CODEX_TASK_TIERS, readCodexModelsCache } from "./codex-models.js";
+import {
+  CODEX_REASONING_EFFORTS,
+  CODEX_TASK_TIERS,
+  extractCodexSkillMentions,
+  findMissingCodexSkills,
+  getCodexHome,
+  readCodexModelsCache,
+} from "./codex-models.js";
 import {
   callChatCompletion,
   fetchProviderModels,
@@ -32,6 +39,8 @@ import {
   type ChatMessage,
   type OffloadResponse,
 } from "./providers.js";
+
+export { findMissingCodexSkills } from "./codex-models.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -387,6 +396,18 @@ export function createServer(deps: ServerDeps = {}): McpServer {
           ? ` | tokens(in=${result.usage.prompt_tokens ?? "?"}, out=${result.usage.completion_tokens ?? "?"}, total=${result.usage.total_tokens ?? "?"})`
           : "";
         const header = `[provider=${result.provider} | model=${result.model}${threadText}${partialText}${attachedSummary}${effortText}${tierText}${usageText}${fallbackText}]`;
+        const mentions = extractCodexSkillMentions(args.prompt);
+        const missing = findMissingCodexSkills(args.prompt, env);
+        const headerLines = [header];
+        if (missing.length > 0) {
+          headerLines.push(
+            `Warning: Codex skill not found in ${path.join(getCodexHome(env), "skills")}: ${missing.map((s) => `$${s}`).join(", ")}`
+          );
+        }
+        if (result.provider !== "codex" && mentions.length > 0) {
+          headerLines.push("Note: $skill mentions only load with provider=codex.");
+        }
+        const responseHeader = headerLines.join("\n");
 
         if (args.output_file) {
           const writtenRel = await writeWorkspaceFile(
@@ -399,7 +420,7 @@ export function createServer(deps: ServerDeps = {}): McpServer {
             content: [
               {
                 type: "text",
-                text: `${header}\nWrote ${result.content.length} chars to "${writtenRel}".\n\nPreview:\n${preview}${result.content.length > 400 ? "\n...[truncated]" : ""}`,
+                text: `${responseHeader}\nWrote ${result.content.length} chars to "${writtenRel}".\n\nPreview:\n${preview}${result.content.length > 400 ? "\n...[truncated]" : ""}`,
               },
             ],
           };
@@ -420,7 +441,7 @@ export function createServer(deps: ServerDeps = {}): McpServer {
           codexDetails.length > 0 ? `\n${codexDetails.join("\n")}` : "";
 
         return {
-          content: [{ type: "text", text: `${header}${detailsBlock}\n\n${body}` }],
+          content: [{ type: "text", text: `${responseHeader}${detailsBlock}\n\n${body}` }],
         };
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);

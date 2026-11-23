@@ -46,6 +46,30 @@ export function getCodexHome(env: NodeJS.ProcessEnv = process.env): string {
   return env.CODEX_HOME?.trim() || path.join(os.homedir(), ".codex");
 }
 
+export function extractCodexSkillMentions(prompt: string): string[] {
+  const names = new Set<string>();
+  for (const match of prompt.matchAll(/(?<![\w$])\$([a-z][a-z0-9-]*)/g)) {
+    const name = match[1];
+    if (name === "env" && prompt[match.index + match[0].length] === ":") {
+      continue;
+    }
+    names.add(name);
+  }
+  return [...names];
+}
+
+export function findMissingCodexSkills(
+  prompt: string,
+  env: NodeJS.ProcessEnv = process.env
+): string[] {
+  const skillsDir = path.join(getCodexHome(env), "skills");
+  return extractCodexSkillMentions(prompt).filter(
+    (name) =>
+      !fs.existsSync(path.join(skillsDir, name, "SKILL.md")) &&
+      !fs.existsSync(path.join(skillsDir, ".system", name, "SKILL.md"))
+  );
+}
+
 export function readCodexModelsCache(env: NodeJS.ProcessEnv = process.env): CodexCachedModel[] | null {
   try {
     const cache: { models?: CodexCachedModel[] } | null = JSON.parse(

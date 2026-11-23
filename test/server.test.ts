@@ -7,7 +7,7 @@ import type { ThreadOptions } from "@openai/codex-sdk";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { createServer } from "../src/index.js";
+import { createServer, findMissingCodexSkills } from "../src/index.js";
 import { callCodexCompletion, type CodexClientFactory } from "../src/codex.js";
 import {
   clampReasoningEffort,
@@ -68,6 +68,23 @@ async function connectTestClient(t: TestContext, deps: Parameters<typeof createS
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
   return client;
 }
+
+test("findMissingCodexSkills checks user and system skills and deduplicates mentions", async (t) => {
+  const env = await createTestCodexHome(t);
+  for (const name of ["ponytail", ".system/imagegen"]) {
+    const dir = path.join(env.CODEX_HOME, "skills", name);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "SKILL.md"), "");
+  }
+
+  assert.deepEqual(
+    findMissingCodexSkills(
+      "Use $ponytail, $missing-skill, $imagegen, $another, and $missing-skill. echo $HOME $env:PATH $1",
+      env
+    ),
+    ["missing-skill", "another"]
+  );
+});
 
 test("provider configs use updated OpenCode Console, Go, and DeepSeek endpoints", () => {
   const configs = getProviderConfigs({});
@@ -342,6 +359,64 @@ test("MCP tools list_offload_models and offload_task work end-to-end with files 
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true });
   }
+});
+
+test("offload_task reports skill notices below the header in both output modes", async (t) => {
+  const env = { ...await createTestCodexHome(t), DEEPSEEK_API_KEY: "ds_test_key" };
+  const skillsDir = path.join(env.CODEX_HOME, "skills");
+  await fs.mkdir(path.join(skillsDir, "ponytail"), { recursive: true });
+  await fs.writeFile(path.join(skillsDir, "ponytail", "SKILL.md"), "");
+  await fs.writeFile(path.join(env.CODEX_HOME, "input.txt"), "Use $attachment-skill.");
+
+  const thread = {
+    id: "thr_skills",
+    async run() {
+      return { finalResponse: "Done.", items: [], usage: null };
+    },
+  };
+  const mockCodexFactory: CodexClientFactory = () => ({
+    startThread: () => thread,
+    resumeThread: () => thread,
+  });
+  const client = await connectTestClient(t, {
+    env,
+    codexFactory: mockCodexFactory,
+    fetchFn: async () => Response.json({
+      model: "deepseek-chat",
+      choices: [{ finish_reason: "stop", message: { content: "Done." } }],
+    }),
+  });
+  const args = {
+    prompt: "Use the $ponytail and $nosuchskill skills. echo $HOME",
+    workspace_dir: env.CODEX_HOME,
+  };
+  const warning = `Warning: Codex skill not found in ${skillsDir}: $nosuchskill`;
+
+  const normal = await client.callTool({
+    name: "offload_task",
+    arguments: { ...args, provider: "codex", allow_fallback: false },
+  });
+  assert.notEqual(normal.isError, true, JSON.stringify(normal.content));
+  const [codexHeader, ...codexBody] = (normal.content as Array<{ text: string }>)[0].text.split("\n");
+  assert.match(codexHeader, /^\[provider=codex \|/);
+  assert.deepEqual(codexBody, [warning, "", "Done."]);
+
+  const output = await client.callTool({
+    name: "offload_task",
+    arguments: { ...args, provider: "deepseek", file_paths: ["input.txt"], output_file: "out.txt" },
+  });
+  assert.notEqual(output.isError, true, JSON.stringify(output.content));
+  const [httpHeader, ...httpBody] = (output.content as Array<{ text: string }>)[0].text.split("\n");
+  assert.match(httpHeader, /^\[provider=deepseek \|/);
+  assert.deepEqual(httpBody, [
+    warning,
+    "Note: $skill mentions only load with provider=codex.",
+    'Wrote 5 chars to "out.txt".',
+    "",
+    "Preview:",
+    "Done.",
+  ]);
+  assert.equal(await fs.readFile(path.join(env.CODEX_HOME, "out.txt"), "utf8"), "Done.");
 });
 
 test("stdio transport spawns dist/index.js and registers both tools", async () => {
