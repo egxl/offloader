@@ -156,6 +156,22 @@ function collectItemSummary(items: readonly ThreadItem[], includeReasoning?: boo
   return { reasoningParts, changedFiles, commandsRun };
 }
 
+export function resolveCodexSandboxMode(
+  explicit?: SandboxMode,
+  env: NodeJS.ProcessEnv = process.env
+): SandboxMode {
+  if (explicit !== undefined) return explicit;
+
+  const mode = env.CODEX_SANDBOX_MODE?.trim();
+  if (!mode) return "read-only";
+  if (mode === "read-only" || mode === "workspace-write" || mode === "danger-full-access") {
+    return mode;
+  }
+  throw new Error(
+    `Invalid CODEX_SANDBOX_MODE ${JSON.stringify(mode)}. Valid values are read-only, workspace-write, and danger-full-access.`
+  );
+}
+
 export async function callCodexCompletion(
   params: CodexOffloadParams,
   env: NodeJS.ProcessEnv = process.env,
@@ -178,7 +194,7 @@ export async function callCodexCompletion(
     codexOptions.env = codexEnv;
   }
 
-  const sandboxMode = params.sandboxMode ?? "read-only";
+  const sandboxMode = resolveCodexSandboxMode(params.sandboxMode, env);
   const selection = selectCodexModelAndEffort({
     prompt: params.prompt,
     model: params.model,

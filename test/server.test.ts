@@ -8,7 +8,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createServer, findMissingCodexSkills } from "../src/index.js";
-import { callCodexCompletion, type CodexClientFactory } from "../src/codex.js";
+import { callCodexCompletion, resolveCodexSandboxMode, type CodexClientFactory } from "../src/codex.js";
 import {
   clampReasoningEffort,
   inferCodexTaskTier,
@@ -132,6 +132,26 @@ test("getFallbackChain uses default order and filters custom entries", () => {
     ["codex", "deepseek"]
   );
   assert.deepEqual(getFallbackChain("codex", env, false), ["codex"]);
+});
+
+test("resolveCodexSandboxMode defaults to read-only for an unset or blank override", () => {
+  assert.equal(resolveCodexSandboxMode(undefined, {}), "read-only");
+  assert.equal(resolveCodexSandboxMode(undefined, { CODEX_SANDBOX_MODE: "  " }), "read-only");
+});
+
+test("resolveCodexSandboxMode accepts an environment override", () => {
+  assert.equal(resolveCodexSandboxMode(undefined, { CODEX_SANDBOX_MODE: " danger-full-access " }), "danger-full-access");
+});
+
+test("resolveCodexSandboxMode prioritizes an explicit argument", () => {
+  assert.equal(resolveCodexSandboxMode("workspace-write", { CODEX_SANDBOX_MODE: "danger-full-access" }), "workspace-write");
+});
+
+test("resolveCodexSandboxMode rejects an invalid environment override", () => {
+  assert.throws(
+    () => resolveCodexSandboxMode(undefined, { CODEX_SANDBOX_MODE: "invalid" }),
+    /CODEX_SANDBOX_MODE.*read-only.*workspace-write.*danger-full-access/,
+  );
 });
 
 test("Windows Codex workspace-write sets default and overridden sandbox config", async (t) => {

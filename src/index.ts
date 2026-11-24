@@ -19,6 +19,7 @@ import {
   callCodexCompletion,
   generateCodexImage,
   getCodexAuthStatus,
+  resolveCodexSandboxMode,
   type CodexClientFactory,
 } from "./codex.js";
 import {
@@ -163,7 +164,7 @@ export function createServer(deps: ServerDeps = {}): McpServer {
         codex_sandbox: z
           .enum(["read-only", "workspace-write", "danger-full-access"])
           .optional()
-          .describe("Codex sandbox mode (default: 'read-only')."),
+          .describe("Codex sandbox mode (defaults to CODEX_SANDBOX_MODE or 'read-only')."),
         codex_reasoning_effort: z
           .enum(CODEX_REASONING_EFFORTS)
           .optional()
@@ -189,12 +190,11 @@ export function createServer(deps: ServerDeps = {}): McpServer {
         const workspaceDir = args.workspace_dir || process.cwd();
         const resolvedProvider = resolveProviderId(args.provider, env);
 
-        const incompatibleCodexOutput =
-          args.output_file &&
-          (args.codex_sandbox === "workspace-write" ||
-            args.codex_sandbox === "danger-full-access");
+        const effectiveSandbox = resolveCodexSandboxMode(args.codex_sandbox, env);
+        const isWriteSandbox = effectiveSandbox !== "read-only";
+        const incompatibleCodexOutput = args.output_file && isWriteSandbox;
         const codexOutputError =
-          `Do not combine output_file with codex_sandbox="${args.codex_sandbox}"; Codex writes files directly and output_file would overwrite "${args.output_file}" with Codex's summary.`;
+          `Do not combine output_file with codex_sandbox="${effectiveSandbox}"; Codex writes files directly and output_file would overwrite "${args.output_file}" with Codex's summary.`;
         if (resolvedProvider === "codex" && incompatibleCodexOutput) {
           throw new Error(codexOutputError);
         }
@@ -218,10 +218,7 @@ export function createServer(deps: ServerDeps = {}): McpServer {
         let attachedSummary = "";
 
         for (const candidate of chain) {
-          const isCodexWrite =
-            candidate === "codex" &&
-            (args.codex_sandbox === "workspace-write" ||
-              args.codex_sandbox === "danger-full-access");
+          const isCodexWrite = candidate === "codex" && isWriteSandbox;
           let preGitStatus: string | null = null;
 
           try {
@@ -316,7 +313,7 @@ export function createServer(deps: ServerDeps = {}): McpServer {
                   model,
                   workingDirectory: workspaceDir,
                   threadId: args.thread_id,
-                  sandboxMode: args.codex_sandbox,
+                  sandboxMode: effectiveSandbox,
                   reasoningEffort: args.codex_reasoning_effort,
                   taskTier: args.task_tier,
                   fileCount: args.file_paths?.length ?? 0,

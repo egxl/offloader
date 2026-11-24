@@ -97,7 +97,7 @@ Delegates coding, testing, refactoring, debugging, reviews, or analysis to the a
 | `allow_fallback` | `boolean` | Fall back across configured providers on errors (default: `true`). |
 | `model` | `string` | Explicit model ID (for Codex, omit to use Pareto auto-selection). |
 | `task_tier` | `"auto" \| "quick" \| "standard" \| "deep" \| "frontier"` | Codex Pareto routing tier (default: `"auto"`). |
-| `codex_sandbox` | `"read-only" \| "workspace-write" \| "danger-full-access"` | Codex sandbox mode (default: `"read-only"`). |
+| `codex_sandbox` | `"read-only" \| "workspace-write" \| "danger-full-access"` | Codex sandbox mode. Defaults to `CODEX_SANDBOX_MODE` or `"read-only"`. |
 | `codex_reasoning_effort` | `"minimal" \| "low" \| "medium" \| "high" \| "xhigh" \| "max" \| "ultra"` | Explicit Codex reasoning effort override. |
 | `file_paths` | `string[]` | Workspace-contained file paths to embed inline up to `CODEX_MAX_EMBED_BYTES` (default 96 KiB, falling back to focus paths above the cap on Codex) or up to 512 KiB on HTTP providers. |
 | `allowed_files` | `string[]` | Workspace-relative file paths the Codex worker is permitted to create or modify in `workspace-write` mode (defaults to `file_paths` when omitted). |
@@ -166,6 +166,7 @@ When `provider` is omitted, the server resolves the active provider in this orde
 | `CODEX_MODEL` | Unset | Default Codex model slug when `model` argument is omitted. |
 | `CODEX_REASONING_EFFORT` | Unset | Default Codex effort (`minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`) when omitted. |
 | `CODEX_AUTO_SELECT` | Enabled | Set to `0` or `false` to disable Pareto auto-selection and use only overrides/SDK defaults. |
+| `CODEX_SANDBOX_MODE` | `read-only` | Default when `codex_sandbox` is omitted. Accepts `read-only`, `workspace-write`, or `danger-full-access`. |
 | `CODEX_WINDOWS_SANDBOX` | `unelevated` | Windows sandbox mode passed for `workspace-write` (`prefer_mxc: true`). |
 | `CODEX_SOFT_TIMEOUT_SECONDS` | `510` | Internal soft-deadline (`AbortController`) for `thread.runStreamed()`; returns partial progress and `threadId` before MCP's 600s hard timeout. |
 | `CODEX_MAX_EMBED_BYTES` | `98304` (`96 KiB`) | Max total bytes of `file_paths` embedded directly into Codex prompts before falling back to path-only focus hints. |
